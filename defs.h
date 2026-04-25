@@ -14,6 +14,9 @@ struct superblock;
 void            binit(void);
 struct buf*     bread(uint, uint);
 void            brelse(struct buf*);
+void            binit(void);
+struct buf*     bread(uint, uint);
+void            brelse(struct buf*);
 void            bwrite(struct buf*);
 
 // console.c
@@ -120,6 +123,9 @@ void            userinit(void);
 int             wait(void);
 void            wakeup(void*);
 void            yield(void);
+int             settickets(int);
+int             clone(void(*fcn)(void*, void*), void*, void*, void*);
+int             join(void**);
 
 // swtch.S
 void            swtch(struct context**, struct context*);

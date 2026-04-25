@@ -88,6 +88,7 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
+  p->tickets = 20; // Default tickets
 
   release(&ptable.lock);
 
@@ -210,6 +211,8 @@ fork(void)
 
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
 
+  np->tickets = curproc->tickets; // Copy tickets
+
   pid = np->pid;
 
   acquire(&ptable.lock);
@@ -281,7 +284,7 @@ wait(void)
     // Scan through table looking for exited children.
     havekids = 0;
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->parent != curproc)
+      if(p->parent != curproc || p->pgdir == curproc->pgdir) // Skip threads
         continue;
       havekids = 1;
       if(p->state == ZOMBIE){
@@ -311,6 +314,14 @@ wait(void)
   }
 }
 
+int
+random(int max)
+{
+  static unsigned int seed = 12345;
+  seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+  return seed % max;
+}
+
 //PAGEBREAK: 42
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
@@ -330,25 +341,36 @@ scheduler(void)
     // Enable interrupts on this processor.
     sti();
 
+    int total_tickets = 0;
+
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
+      if(p->state == RUNNABLE)
+        total_tickets += p->tickets;
+    }
 
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
-      c->proc = p;
-      switchuvm(p);
-      p->state = RUNNING;
+    if(total_tickets > 0){
+      int winner = random(total_tickets);
+      int current_tickets = 0;
 
-      swtch(&(c->scheduler), p->context);
-      switchkvm();
+      for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+        if(p->state != RUNNABLE)
+          continue;
+        
+        current_tickets += p->tickets;
+        if(current_tickets > winner){
+          c->proc = p;
+          switchuvm(p);
+          p->state = RUNNING;
 
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
-      c->proc = 0;
+          swtch(&(c->scheduler), p->context);
+          switchkvm();
+
+          c->proc = 0;
+          break;
+        }
+      }
     }
     release(&ptable.lock);
 
@@ -494,6 +516,113 @@ kill(int pid)
   }
   release(&ptable.lock);
   return -1;
+}
+
+int
+settickets(int number)
+{
+  if(number < 1)
+    return -1;
+  acquire(&ptable.lock);
+  myproc()->tickets = number;
+  release(&ptable.lock);
+  return 0;
+}
+
+int
+clone(void(*fcn)(void*, void*), void *arg1, void *arg2, void *stack)
+{
+  int i, pid;
+  struct proc *np;
+  struct proc *curproc = myproc();
+
+  // Allocate process.
+  if((np = allocproc()) == 0){
+    return -1;
+  }
+
+  // Share address space
+  np->pgdir = curproc->pgdir;
+  np->sz = curproc->sz;
+  np->parent = curproc;
+  *np->tf = *curproc->tf;
+
+  // Clear %eax so that clone returns 0 in the child.
+  np->tf->eax = 0;
+
+  // Set up stack
+  uint ustack[3];
+  ustack[0] = 0xffffffff; // fake return PC
+  ustack[1] = (uint)arg1;
+  ustack[2] = (uint)arg2;
+
+  uint esp = (uint)stack + 4096; // Assume stack is one page
+  esp -= 12;
+  if(copyout(np->pgdir, esp, ustack, 12) < 0) {
+    // Should clean up np
+    return -1;
+  }
+
+  np->tf->esp = esp;
+  np->tf->eip = (uint)fcn;
+
+  for(i = 0; i < NOFILE; i++)
+    if(curproc->ofile[i])
+      np->ofile[i] = filedup(curproc->ofile[i]);
+  np->cwd = idup(curproc->cwd);
+
+  safestrcpy(np->name, curproc->name, sizeof(curproc->name));
+  np->tickets = curproc->tickets;
+
+  pid = np->pid;
+
+  acquire(&ptable.lock);
+  np->state = RUNNABLE;
+  release(&ptable.lock);
+
+  return pid;
+}
+
+int
+join(void **stack)
+{
+  struct proc *p;
+  int havekids, pid;
+  struct proc *curproc = myproc();
+  
+  acquire(&ptable.lock);
+  for(;;){
+    // Scan through table looking for exited threads.
+    havekids = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      if(p->parent != curproc || p->pgdir != curproc->pgdir)
+        continue;
+      havekids = 1;
+      if(p->state == ZOMBIE){
+        // Found one.
+        pid = p->pid;
+        if(stack != 0)
+           *stack = (void*)p->tf->ebp; // This is a simplification
+        
+        kfree(p->kstack);
+        p->kstack = 0;
+        p->pid = 0;
+        p->parent = 0;
+        p->name[0] = 0;
+        p->killed = 0;
+        p->state = UNUSED;
+        release(&ptable.lock);
+        return pid;
+      }
+    }
+
+    if(!havekids || curproc->killed){
+      release(&ptable.lock);
+      return -1;
+    }
+
+    sleep(curproc, &ptable.lock);
+  }
 }
 
 //PAGEBREAK: 36
